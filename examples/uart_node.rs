@@ -64,7 +64,7 @@ async fn main(spawner: Spawner) {
         let mut buf = [0u8; 1];
         {
             let mut uart_guard = uart_mutex.lock().await;
-            if uart_guard.read_buffered(&mut buf).is_ok() {
+            if uart_guard.read(&mut buf).is_ok() {
                 match buf[0] {
                     0x01 => {
                         *active_flag.lock().await = true;
