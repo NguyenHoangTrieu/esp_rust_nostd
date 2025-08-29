@@ -22,7 +22,7 @@ static UART_CELL: StaticCell<Mutex<RawMutex, Uart<'static, Blocking>>> = StaticC
 
 // GPIO Register - 8-bit register to manage 8 GPIO pins (GLOBAL ONLY)
 static GPIO_REGISTER: StaticCell<Mutex<RawMutex, u8>> = StaticCell::new();
-static mut ADC_REGISTER: StaticCell<Mutex<RawMutex, u16>> = StaticCell::new();
+static ADC_REGISTER: StaticCell<Mutex<RawMutex, u16>> = StaticCell::new();
 // Static cells for RS485 direction control pins
 static RE_PIN_CELL: StaticCell<Mutex<RawMutex, Output<'static>>> = StaticCell::new();
 static DE_PIN_CELL: StaticCell<Mutex<RawMutex, Output<'static>>> = StaticCell::new();
@@ -38,7 +38,7 @@ mod mod_lib{
 use mod_lib::modbus_handler::*;
 
 // Modbus node address
-const NODE_ADDRESS: u8 = 0x03;
+const NODE_ADDRESS: u8 = 0x04;
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
@@ -71,12 +71,13 @@ async fn main(spawner: Spawner) {
     let re_pin = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());   // Receiver Enable (active low)
     let de_pin = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());   // Driver Enable (active high)
     // ADC pin set up:
-        let analog_pin = peripherals.GPIO2;
+        let analog_pin = peripherals.GPIO33;
     let mut adc1_config = AdcConfig::new();
     let mut pin = adc1_config.enable_pin(
     analog_pin,
     Attenuation::_11dB,
     );
+        let mut adc1 = Adc::new(peripherals.ADC1, adc1_config);
     // Initialize static cells
     let uart_mutex: &'static Mutex<RawMutex, Uart<'static, Blocking>> =
         UART_CELL.init(Mutex::new(uart));
@@ -90,14 +91,14 @@ async fn main(spawner: Spawner) {
     
     let de_pin_mutex: &'static Mutex<RawMutex, Output<'static>> =
         DE_PIN_CELL.init(Mutex::new(de_pin));
-
+    let adc_register: &'static Mutex<RawMutex, u16> = ADC_REGISTER.init(Mutex::new(0));
     // Set Modbus UART handle
     unsafe {
         crate::mod_lib::modbus_handler::MODBUS_UART_HANDLE = Some(uart_mutex);
     }
 
     // Spawn tasks with RE/DE pin parameters
-    spawner.spawn(uart_task(uart_mutex, gpio_register, re_pin_mutex, de_pin_mutex)).unwrap();
+    spawner.spawn(uart_task(uart_mutex, gpio_register, re_pin_mutex, de_pin_mutex, adc_register)).unwrap();
 
     // MAIN TASK: Bidirectional GPIO <-> Register sync
     loop {
@@ -129,6 +130,14 @@ async fn main(spawner: Spawner) {
         if current_register & (1 << 5) != 0 { gpio5.set_high(); } else { gpio5.set_low(); }
         if current_register & (1 << 6) != 0 { gpio6.set_high(); } else { gpio6.set_low(); }
         if current_register & (1 << 7) != 0 { gpio7.set_high(); } else { gpio7.set_low(); }
+
+        //3. Read ADC value:
+        let adc_value: u16 = nb::block!(adc1.read_oneshot(&mut pin)).unwrap();
+        // Update ADC register:
+        {
+            let mut adc_guard = adc_register.lock().await;
+            *adc_guard = adc_value;
+        }
         Timer::after(Duration::from_millis(100)).await;
     }
 }
@@ -139,6 +148,7 @@ async fn uart_task(
     gpio_register: &'static Mutex<RawMutex, u8>,
     re_pin_mutex: &'static Mutex<RawMutex, Output<'static>>,  // RE pin mutex
     de_pin_mutex: &'static Mutex<RawMutex, Output<'static>>,  // DE pin mutex
+    adc_register: &'static Mutex<RawMutex, u16>,
 ) {
     let mut modbus_buffer = [0u8; 8];
     let mut buffer_pos = 0;
@@ -246,7 +256,38 @@ async fn uart_task(
                     }
                 },
                 0x04 =>{
+                    // Function Code 0x04: Read Input Registers (for ADC value)
+                    // Parse starting address (bytes 2-3)
+                    let start_addr = ((modbus_buffer[2] as u16) << 8) | (modbus_buffer[3] as u16);
+                    // Parse quantity of registers requested (bytes 4-5)  
+                    let requested_quantity = ((modbus_buffer[4] as u16) << 8) | (modbus_buffer[5] as u16);
+                    
+                    // Validate starting address (0x0000 for ADC register)
+                    if start_addr == 0 && requested_quantity == 1 {
+                        // Get current ADC register value
+                        let adc_value = *adc_register.lock().await;
 
+                        // Prepare response data (2 bytes for one register)
+                        let response_data = [
+                            2,                      // Byte count
+                            (adc_value >> 8) as u8, // High byte
+                            (adc_value & 0xFF) as u8, // Low byte
+                        ];
+                        
+                        // Build response using modbus_handler
+                        if let Some(response_frame) = modbus_build_frame(
+                            NODE_ADDRESS,
+                            FunctionCode::Read(ReadCode::InputRegisters),
+                            &response_data
+                        ) 
+                        {
+                            // Send response using modbus_handler
+                            drop(uart_guard); // Release UART lock before async call
+                            let _ = modbus_write_frame(&response_frame).await;
+                            Timer::after(Duration::from_millis(1)).await;
+                            continue; // Skip to next iteration since uart_guard is dropped
+                        }
+                    }
                 },
                 // Function Code 0x05: Write Single Coil
                 0x05 => {
